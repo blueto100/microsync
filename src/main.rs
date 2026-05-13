@@ -10,7 +10,6 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use argon2::{
-    password_hash::{PasswordHasher, SaltString},
     Argon2,
 };
 use rand::RngCore;
@@ -69,14 +68,34 @@ impl MicroSyncApp {
     }
 
     fn derive_key(room: &str, password: &str) -> [u8; 32] {
-        // Simple key derivation using room as salt
-        // In a production app, we'd use a more robust salt strategy
-        let salt = SaltString::encode_b64(room.as_bytes()).unwrap_or_else(|_| SaltString::from_b64("c2FsdHlzYWx0").unwrap());
+        use argon2::password_hash::{SaltString, PasswordHasher};
+        
+        // Create a 16-byte buffer from the room name (padded/truncated)
+        let mut salt_bytes = [0u8; 16];
+        let room_bytes = room.as_bytes();
+        for i in 0..16 {
+            if i < room_bytes.len() {
+                salt_bytes[i] = room_bytes[i];
+            } else {
+                salt_bytes[i] = b'0' + (i as u8);
+            }
+        }
+
+        // Encode to Base64 to make it a valid SaltString
+        let salt_str = SaltString::encode_b64(&salt_bytes).unwrap();
         let argon2 = Argon2::default();
-        let hash = argon2.hash_password(password.as_bytes(), &salt).unwrap();
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&hash.hash.unwrap().as_bytes()[..32]);
-        key
+        
+        if let Ok(hash) = argon2.hash_password(password.as_bytes(), &salt_str) {
+            if let Some(output) = hash.hash {
+                let mut key = [0u8; 32];
+                let bytes = output.as_bytes();
+                let len = bytes.len().min(32);
+                key[..len].copy_from_slice(&bytes[..len]);
+                return key;
+            }
+        }
+        
+        [0u8; 32]
     }
 }
 
