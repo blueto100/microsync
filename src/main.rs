@@ -27,7 +27,7 @@ pub enum PacketType {
     Chat(String),
     Ping,
     Pong,
-    VideoSignal(String), // SDP Signaling for WebRTC
+    VideoSignal(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -81,13 +81,16 @@ struct MicroSyncApp {
     settings: Arc<Mutex<ConnectionSettings>>,
     chat_history: Arc<Mutex<Vec<(String, String)>>>,
     current_input: String,
+    new_friend_name: String,
+    new_friend_ip: String,
+    new_friend_port: String,
     tx: mpsc::UnboundedSender<SecurePacket>,
     connect_tx: mpsc::UnboundedSender<()>,
     store: FriendsStore,
 }
 
 impl MicroSyncApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let store = FriendsStore { path: "friends.toml".to_string() };
         let mut initial_settings = ConnectionSettings::default();
         initial_settings.friends = store.load();
@@ -103,6 +106,9 @@ impl MicroSyncApp {
             settings,
             chat_history,
             current_input: String::new(),
+            new_friend_name: String::new(),
+            new_friend_ip: String::new(),
+            new_friend_port: "5555".to_string(),
             tx,
             connect_tx,
             store,
@@ -146,31 +152,29 @@ impl eframe::App for MicroSyncApp {
                     let color = if friend.is_online { egui::Color32::GREEN } else { egui::Color32::GRAY };
                     ui.colored_label(color, "●");
                     ui.label(name);
-                    if ui.small_button("Call").clicked() {
-                        // WebRTC Trigger placeholder
-                    }
+                    ui.label(format!("({}:{})", friend.ip, friend.port));
                 });
             }
 
             ui.add_space(20.0);
             ui.label("Add Friend:");
-            static mut NEW_NAME: String = String::new();
-            static mut NEW_IP: String = String::new();
-            unsafe {
-                ui.text_edit_singleline(&mut NEW_NAME);
-                ui.text_edit_singleline(&mut NEW_IP);
-                if ui.button("Add").clicked() && !NEW_NAME.is_empty() {
-                    settings.friends.insert(NEW_NAME.clone(), Friend {
-                        name: NEW_NAME.clone(),
-                        ip: NEW_IP.clone(),
-                        port: 5555,
-                        is_online: false,
-                        last_seen: None,
-                    });
-                    self.store.save(&settings.friends);
-                    NEW_NAME.clear();
-                    NEW_IP.clear();
-                }
+            ui.add(egui::TextEdit::singleline(&mut self.new_friend_name).hint_text("Name"));
+            ui.add(egui::TextEdit::singleline(&mut self.new_friend_ip).hint_text("IP Address"));
+            ui.add(egui::TextEdit::singleline(&mut self.new_friend_port).hint_text("Port"));
+            
+            if ui.button("Add Friend").clicked() && !self.new_friend_name.is_empty() {
+                let port = self.new_friend_port.parse::<u16>().unwrap_or(5555);
+                settings.friends.insert(self.new_friend_name.clone(), Friend {
+                    name: self.new_friend_name.clone(),
+                    ip: self.new_friend_ip.clone(),
+                    port,
+                    is_online: false,
+                    last_seen: None,
+                });
+                self.store.save(&settings.friends);
+                self.new_friend_name.clear();
+                self.new_friend_ip.clear();
+                self.new_friend_port = "5555".to_string();
             }
         });
 
@@ -206,7 +210,7 @@ impl eframe::App for MicroSyncApp {
         egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
             ui.add_space(5.0);
             ui.horizontal(|ui| {
-                let response = ui.add_sized([ui.available_width() - 60.0, 30.0], egui::TextEdit::singleline(&mut self.current_input));
+                let response = ui.add_sized([ui.available_width() - 60.0, 30.0], egui::TextEdit::singleline(&mut self.current_input).hint_text("Type a message..."));
                 if (ui.button("Send").clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))) && !self.current_input.is_empty() {
                     let _ = self.tx.send(SecurePacket {
                         sender: settings.username.clone(),
@@ -263,7 +267,6 @@ fn start_networking(
                                 }
                             }
                         }
-                        // Add to local chat if it was a chat packet
                         if let PacketType::Chat(text) = packet.p_type {
                             chat.lock().unwrap().push((packet.sender, text));
                         }
@@ -291,7 +294,6 @@ fn start_networking(
                                     match packet.p_type {
                                         PacketType::Chat(text) => chat.lock().unwrap().push((packet.sender, text)),
                                         PacketType::Ping => {
-                                            // Handle ping and update friend online status
                                             let mut s = settings.lock().unwrap();
                                             if let Some(f) = s.friends.values_mut().find(|f| f.ip == addr.ip().to_string()) {
                                                 f.is_online = true;
