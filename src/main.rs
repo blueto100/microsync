@@ -5,24 +5,54 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::net::UdpSocket;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit},
-    ChaCha20Poly1305, Nonce,
-};
-use argon2::{
-    Argon2,
-};
+use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
+use argon2::Argon2;
 use rand::RngCore;
+use std::collections::HashMap;
+use std::fs;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChatMessage {
-    pub sender: String,
-    pub text: String,
+pub struct Friend {
+    pub name: String,
+    pub ip: String,
+    pub port: u16,
+    #[serde(skip)]
+    pub is_online: bool,
+    #[serde(skip)]
+    pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct AppState {
-    pub history: Vec<ChatMessage>,
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum PacketType {
+    Chat(String),
+    Ping,
+    Pong,
+    VideoSignal(String), // SDP Signaling for WebRTC
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SecurePacket {
+    pub sender: String,
+    pub p_type: PacketType,
+}
+
+struct FriendsStore {
+    path: String,
+}
+
+impl FriendsStore {
+    fn load(&self) -> HashMap<String, Friend> {
+        if let Ok(content) = fs::read_to_string(&self.path) {
+            toml::from_str(&content).unwrap_or_default()
+        } else {
+            HashMap::new()
+        }
+    }
+    fn save(&self, friends: &HashMap<String, Friend>) {
+        if let Ok(content) = toml::to_string(friends) {
+            let _ = fs::write(&self.path, content);
+        }
+    }
 }
 
 struct ConnectionSettings {
@@ -30,12 +60,8 @@ struct ConnectionSettings {
     room_name: String,
     password: String,
     local_port: u16,
-    peer_ip: String,
-    peer_port: u16,
     is_connected: bool,
-    packets_sent: u64,
-    packets_received: u64,
-    last_peer_seen: String,
+    friends: HashMap<String, Friend>,
 }
 
 impl Default for ConnectionSettings {
@@ -45,33 +71,42 @@ impl Default for ConnectionSettings {
             room_name: "default_room".to_string(),
             password: "".to_string(),
             local_port: 5555,
-            peer_ip: "127.0.0.1".to_string(),
-            peer_port: 5555,
             is_connected: false,
-            packets_sent: 0,
-            packets_received: 0,
-            last_peer_seen: "None".to_string(),
+            friends: HashMap::new(),
         }
     }
 }
 
 struct MicroSyncApp {
-    state: Arc<Mutex<AppState>>,
     settings: Arc<Mutex<ConnectionSettings>>,
+    chat_history: Arc<Mutex<Vec<(String, String)>>>,
     current_input: String,
-    tx: mpsc::UnboundedSender<AppState>,
+    tx: mpsc::UnboundedSender<SecurePacket>,
     connect_tx: mpsc::UnboundedSender<()>,
+    store: FriendsStore,
 }
 
 impl MicroSyncApp {
-    fn new(
-        _cc: &eframe::CreationContext<'_>,
-        state: Arc<Mutex<AppState>>,
-        settings: Arc<Mutex<ConnectionSettings>>,
-        tx: mpsc::UnboundedSender<AppState>,
-        connect_tx: mpsc::UnboundedSender<()>,
-    ) -> Self {
-        Self { state, settings, current_input: String::new(), tx, connect_tx }
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let store = FriendsStore { path: "friends.toml".to_string() };
+        let mut initial_settings = ConnectionSettings::default();
+        initial_settings.friends = store.load();
+
+        let (tx, rx_net) = mpsc::unbounded_channel::<SecurePacket>();
+        let (connect_tx, connect_rx) = mpsc::unbounded_channel::<()>();
+        let settings = Arc::new(Mutex::new(initial_settings));
+        let chat_history = Arc::new(Mutex::new(Vec::new()));
+
+        start_networking(settings.clone(), chat_history.clone(), rx_net, connect_rx);
+
+        Self {
+            settings,
+            chat_history,
+            current_input: String::new(),
+            tx,
+            connect_tx,
+            store,
+        }
     }
 
     fn derive_key(room: &str, password: &str) -> [u8; 32] {
@@ -99,140 +134,138 @@ impl MicroSyncApp {
 
 impl eframe::App for MicroSyncApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut state = self.state.lock().unwrap();
         let mut settings = self.settings.lock().unwrap();
+        let chat = self.chat_history.lock().unwrap();
 
-        egui::TopBottomPanel::top("settings").show(ctx, |ui| {
+        egui::SidePanel::left("friends_list").show(ctx, |ui| {
+            ui.heading("👥 Friends");
+            ui.separator();
+            
+            for (name, friend) in &settings.friends {
+                ui.horizontal(|ui| {
+                    let color = if friend.is_online { egui::Color32::GREEN } else { egui::Color32::GRAY };
+                    ui.colored_label(color, "●");
+                    ui.label(name);
+                    if ui.small_button("Call").clicked() {
+                        // WebRTC Trigger placeholder
+                    }
+                });
+            }
+
+            ui.add_space(20.0);
+            ui.label("Add Friend:");
+            static mut NEW_NAME: String = String::new();
+            static mut NEW_IP: String = String::new();
+            unsafe {
+                ui.text_edit_singleline(&mut NEW_NAME);
+                ui.text_edit_singleline(&mut NEW_IP);
+                if ui.button("Add").clicked() && !NEW_NAME.is_empty() {
+                    settings.friends.insert(NEW_NAME.clone(), Friend {
+                        name: NEW_NAME.clone(),
+                        ip: NEW_IP.clone(),
+                        port: 5555,
+                        is_online: false,
+                        last_seen: None,
+                    });
+                    self.store.save(&settings.friends);
+                    NEW_NAME.clear();
+                    NEW_IP.clear();
+                }
+            }
+        });
+
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("🔒 Secure Chat");
+                ui.heading("🔒 MicroSync P2P");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(if settings.is_connected { "Reconnect" } else { "Connect" }).clicked() {
+                    if ui.button(if settings.is_connected { "Connected" } else { "Connect" }).clicked() {
                         let _ = self.connect_tx.send(());
                     }
                 });
             });
-
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut settings.username).hint_text("Name").desired_width(60.0));
-                ui.add(egui::TextEdit::singleline(&mut settings.room_name).hint_text("Room").desired_width(80.0));
-                ui.add(egui::TextEdit::singleline(&mut settings.password).password(true).hint_text("Pass").desired_width(80.0));
-                ui.label("Port:");
+                ui.add(egui::TextEdit::singleline(&mut settings.username).hint_text("Name").desired_width(100.0));
+                ui.add(egui::TextEdit::singleline(&mut settings.room_name).hint_text("Room").desired_width(100.0));
+                ui.add(egui::TextEdit::singleline(&mut settings.password).password(true).hint_text("Pass").desired_width(100.0));
+                ui.label("Local Port:");
                 ui.add(egui::DragValue::new(&mut settings.local_port));
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Friend IP:");
-                ui.add(egui::TextEdit::singleline(&mut settings.peer_ip).desired_width(120.0));
-                ui.label("Port:");
-                ui.add(egui::DragValue::new(&mut settings.peer_port));
-            });
-            
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("📤 Sent: {}", settings.packets_sent)).size(10.0).color(egui::Color32::LIGHT_BLUE));
-                ui.label(egui::RichText::new(format!("📥 Received: {}", settings.packets_received)).size(10.0).color(egui::Color32::LIGHT_GREEN));
-                ui.label(egui::RichText::new(format!("📍 Last From: {}", settings.last_peer_seen)).size(10.0).color(egui::Color32::GRAY));
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if !settings.is_connected {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Enter settings and click Connect");
-                });
-            } else {
-                egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                    for msg in &state.history {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("{}: ", msg.sender)).strong());
-                            ui.label(&msg.text);
-                        });
-                    }
-                });
-            }
+            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                for (sender, text) in chat.iter() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{}: ", sender)).strong());
+                        ui.label(text);
+                    });
+                }
+            });
         });
 
-        if settings.is_connected {
-            egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    let response = ui.add_sized(
-                        [ui.available_width() - 60.0, 30.0],
-                        egui::TextEdit::singleline(&mut self.current_input).hint_text("Type a message...")
-                    );
-                    
-                    if (ui.button("Send").clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))) && !self.current_input.is_empty() {
-                        state.history.push(ChatMessage {
-                            sender: settings.username.clone(),
-                            text: self.current_input.clone(),
-                        });
-                        let _ = self.tx.send(state.clone());
-                        self.current_input.clear();
-                        response.request_focus();
-                    }
-                });
-                ui.add_space(5.0);
+        egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
+            ui.add_space(5.0);
+            ui.horizontal(|ui| {
+                let response = ui.add_sized([ui.available_width() - 60.0, 30.0], egui::TextEdit::singleline(&mut self.current_input));
+                if (ui.button("Send").clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))) && !self.current_input.is_empty() {
+                    let _ = self.tx.send(SecurePacket {
+                        sender: settings.username.clone(),
+                        p_type: PacketType::Chat(self.current_input.clone()),
+                    });
+                    self.current_input.clear();
+                    response.request_focus();
+                }
             });
-        }
+            ui.add_space(5.0);
+        });
 
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), eframe::Error> {
-    env_logger::init();
-
-    let state = Arc::new(Mutex::new(AppState::default()));
-    let settings = Arc::new(Mutex::new(ConnectionSettings::default()));
-    
-    let (tx, mut rx) = mpsc::unbounded_channel::<AppState>();
-    let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<()>();
-
-    let net_state = state.clone();
-    let net_settings = settings.clone();
+fn start_networking(
+    settings: Arc<Mutex<ConnectionSettings>>,
+    chat: Arc<Mutex<Vec<(String, String)>>>,
+    mut rx_out: mpsc::UnboundedReceiver<SecurePacket>,
+    mut rx_conn: mpsc::UnboundedReceiver<()>,
+) {
     tokio::spawn(async move {
         let mut socket: Option<Arc<UdpSocket>> = None;
         let mut key: Option<[u8; 32]> = None;
 
         loop {
             tokio::select! {
-                _ = connect_rx.recv() => {
-                    let (bind_addr, k_params) = {
-                        let s = net_settings.lock().unwrap();
+                _ = rx_conn.recv() => {
+                    let (addr, k_params) = {
+                        let s = settings.lock().unwrap();
                         (format!("0.0.0.0:{}", s.local_port), (s.room_name.clone(), s.password.clone()))
                     };
-                    
-                    match UdpSocket::bind(&bind_addr).await {
-                        Ok(sock) => {
-                            println!("✅ Bound to {}", bind_addr);
-                            socket = Some(Arc::new(sock));
-                            key = Some(MicroSyncApp::derive_key(&k_params.0, &k_params.1));
-                            net_settings.lock().unwrap().is_connected = true;
-                        }
-                        Err(e) => println!("❌ Bind error: {}", e),
+                    if let Ok(sock) = UdpSocket::bind(&addr).await {
+                        socket = Some(Arc::new(sock));
+                        key = Some(MicroSyncApp::derive_key(&k_params.0, &k_params.1));
+                        settings.lock().unwrap().is_connected = true;
                     }
                 }
 
-                Some(new_state) = rx.recv() => {
+                Some(packet) = rx_out.recv() => {
                     if let (Some(sock), Some(k)) = (&socket, &key) {
-                        let target = {
-                            let s = net_settings.lock().unwrap();
-                            format!("{}:{}", s.peer_ip, s.peer_port)
-                        };
-
-                        if let Ok(data) = bincode::serialize(&new_state) {
-                            let cipher = ChaCha20Poly1305::new(k.into());
-                            let mut nonce_bytes = [0u8; 12];
-                            rand::thread_rng().fill_bytes(&mut nonce_bytes);
-                            let nonce = Nonce::from_slice(&nonce_bytes);
-
-                            if let Ok(ciphertext) = cipher.encrypt(nonce, data.as_ref()) {
-                                let mut packet = nonce_bytes.to_vec();
-                                packet.extend_from_slice(&ciphertext);
-                                if let Ok(_) = sock.send_to(&packet, &target).await {
-                                    net_settings.lock().unwrap().packets_sent += 1;
+                        let friends = settings.lock().unwrap().friends.clone();
+                        for friend in friends.values() {
+                            let target = format!("{}:{}", friend.ip, friend.port);
+                            if let Ok(data) = bincode::serialize(&packet) {
+                                let cipher = ChaCha20Poly1305::new(k.into());
+                                let mut nonce = [0u8; 12];
+                                rand::thread_rng().fill_bytes(&mut nonce);
+                                if let Ok(ct) = cipher.encrypt(Nonce::from_slice(&nonce), data.as_ref()) {
+                                    let mut pkt = nonce.to_vec();
+                                    pkt.extend_from_slice(&ct);
+                                    let _ = sock.send_to(&pkt, target).await;
                                 }
                             }
+                        }
+                        // Add to local chat if it was a chat packet
+                        if let PacketType::Chat(text) = packet.p_type {
+                            chat.lock().unwrap().push((packet.sender, text));
                         }
                     }
                 }
@@ -249,21 +282,24 @@ async fn main() -> Result<(), eframe::Error> {
                         None
                     }
                 } => {
-                    if let (Some((packet, addr)), Some(k)) = (res, &key) {
-                        let mut s_lock = net_settings.lock().unwrap();
-                        s_lock.packets_received += 1;
-                        s_lock.last_peer_seen = addr.to_string();
-                        drop(s_lock);
-
-                        if packet.len() > 12 {
-                            let nonce = Nonce::from_slice(&packet[..12]);
-                            let ciphertext = &packet[12..];
+                    if let (Some((pkt, addr)), Some(k)) = (res, &key) {
+                        if pkt.len() > 12 {
+                            let nonce = Nonce::from_slice(&pkt[..12]);
                             let cipher = ChaCha20Poly1305::new(k.into());
-
-                            if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
-                                if let Ok(new_state) = bincode::deserialize::<AppState>(&plaintext) {
-                                    let mut s = net_state.lock().unwrap();
-                                    *s = new_state;
+                            if let Ok(pt) = cipher.decrypt(nonce, &pkt[12..]) {
+                                if let Ok(packet) = bincode::deserialize::<SecurePacket>(&pt) {
+                                    match packet.p_type {
+                                        PacketType::Chat(text) => chat.lock().unwrap().push((packet.sender, text)),
+                                        PacketType::Ping => {
+                                            // Handle ping and update friend online status
+                                            let mut s = settings.lock().unwrap();
+                                            if let Some(f) = s.friends.values_mut().find(|f| f.ip == addr.ip().to_string()) {
+                                                f.is_online = true;
+                                                f.last_seen = Some(chrono::Utc::now());
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -272,16 +308,13 @@ async fn main() -> Result<(), eframe::Error> {
             }
         }
     });
+}
 
+#[tokio::main]
+async fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([500.0, 600.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
         ..Default::default()
     };
-
-    eframe::run_native(
-        "MicroSync Diagnostics",
-        options,
-        Box::new(|cc| Box::new(MicroSyncApp::new(cc, state, settings, tx, connect_tx))),
-    )
+    eframe::run_native("MicroSync Ultra", options, Box::new(|cc| Box::new(MicroSyncApp::new(cc))))
 }

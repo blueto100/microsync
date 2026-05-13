@@ -21,6 +21,11 @@ chacha20poly1305 = "0.10"
 argon2 = "0.5"
 rand = "0.8"
 
+# Media & Persistence
+webrtc = "0.11"
+toml = "0.8"
+chrono = "0.4"
+
 # Utilities
 log = "0.4"
 env_logger = "0.11"
