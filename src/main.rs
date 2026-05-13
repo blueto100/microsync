@@ -14,8 +14,6 @@ use argon2::{
 };
 use rand::RngCore;
 
-const DEFAULT_PORT: u16 = 5555;
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatMessage {
     pub sender: String,
@@ -31,8 +29,13 @@ struct ConnectionSettings {
     username: String,
     room_name: String,
     password: String,
+    local_port: u16,
     peer_ip: String,
+    peer_port: u16,
     is_connected: bool,
+    packets_sent: u64,
+    packets_received: u64,
+    last_peer_seen: String,
 }
 
 impl Default for ConnectionSettings {
@@ -41,8 +44,13 @@ impl Default for ConnectionSettings {
             username: "User".to_string(),
             room_name: "default_room".to_string(),
             password: "".to_string(),
+            local_port: 5555,
             peer_ip: "127.0.0.1".to_string(),
+            peer_port: 5555,
             is_connected: false,
+            packets_sent: 0,
+            packets_received: 0,
+            last_peer_seen: "None".to_string(),
         }
     }
 }
@@ -96,7 +104,7 @@ impl eframe::App for MicroSyncApp {
 
         egui::TopBottomPanel::top("settings").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("🔒 MicroSync Chat");
+                ui.heading("🔒 Secure Chat");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(if settings.is_connected { "Reconnect" } else { "Connect" }).clicked() {
                         let _ = self.connect_tx.send(());
@@ -105,20 +113,33 @@ impl eframe::App for MicroSyncApp {
             });
 
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut settings.username).hint_text("Username").desired_width(100.0));
-                ui.add(egui::TextEdit::singleline(&mut settings.room_name).hint_text("Room").desired_width(100.0));
-                ui.add(egui::TextEdit::singleline(&mut settings.password).password(true).hint_text("Pass").desired_width(100.0));
-                ui.add(egui::TextEdit::singleline(&mut settings.peer_ip).hint_text("Peer IP"));
+                ui.add(egui::TextEdit::singleline(&mut settings.username).hint_text("Name").desired_width(60.0));
+                ui.add(egui::TextEdit::singleline(&mut settings.room_name).hint_text("Room").desired_width(80.0));
+                ui.add(egui::TextEdit::singleline(&mut settings.password).password(true).hint_text("Pass").desired_width(80.0));
+                ui.label("Port:");
+                ui.add(egui::DragValue::new(&mut settings.local_port));
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Friend IP:");
+                ui.add(egui::TextEdit::singleline(&mut settings.peer_ip).desired_width(120.0));
+                ui.label("Port:");
+                ui.add(egui::DragValue::new(&mut settings.peer_port));
+            });
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("📤 Sent: {}", settings.packets_sent)).size(10.0).color(egui::Color32::LIGHT_BLUE));
+                ui.label(egui::RichText::new(format!("📥 Received: {}", settings.packets_received)).size(10.0).color(egui::Color32::LIGHT_GREEN));
+                ui.label(egui::RichText::new(format!("📍 Last From: {}", settings.last_peer_seen)).size(10.0).color(egui::Color32::GRAY));
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if !settings.is_connected {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Connect to start chatting...");
+                    ui.label("Enter settings and click Connect");
                 });
             } else {
-                // Chat History Area
                 egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                     for msg in &state.history {
                         ui.horizontal(|ui| {
@@ -153,7 +174,7 @@ impl eframe::App for MicroSyncApp {
             });
         }
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 
@@ -176,17 +197,19 @@ async fn main() -> Result<(), eframe::Error> {
         loop {
             tokio::select! {
                 _ = connect_rx.recv() => {
-                    let bind_addr = format!("0.0.0.0:{}", DEFAULT_PORT);
+                    let (bind_addr, k_params) = {
+                        let s = net_settings.lock().unwrap();
+                        (format!("0.0.0.0:{}", s.local_port), (s.room_name.clone(), s.password.clone()))
+                    };
+                    
                     match UdpSocket::bind(&bind_addr).await {
                         Ok(sock) => {
-                            println!("✅ Socket bound to {}", bind_addr);
+                            println!("✅ Bound to {}", bind_addr);
                             socket = Some(Arc::new(sock));
-                            let s = net_settings.lock().unwrap();
-                            key = Some(MicroSyncApp::derive_key(&s.room_name, &s.password));
-                            drop(s);
+                            key = Some(MicroSyncApp::derive_key(&k_params.0, &k_params.1));
                             net_settings.lock().unwrap().is_connected = true;
                         }
-                        Err(e) => println!("❌ Failed to bind: {}", e),
+                        Err(e) => println!("❌ Bind error: {}", e),
                     }
                 }
 
@@ -194,7 +217,7 @@ async fn main() -> Result<(), eframe::Error> {
                     if let (Some(sock), Some(k)) = (&socket, &key) {
                         let target = {
                             let s = net_settings.lock().unwrap();
-                            format!("{}:{}", s.peer_ip, DEFAULT_PORT)
+                            format!("{}:{}", s.peer_ip, s.peer_port)
                         };
 
                         if let Ok(data) = bincode::serialize(&new_state) {
@@ -206,8 +229,9 @@ async fn main() -> Result<(), eframe::Error> {
                             if let Ok(ciphertext) = cipher.encrypt(nonce, data.as_ref()) {
                                 let mut packet = nonce_bytes.to_vec();
                                 packet.extend_from_slice(&ciphertext);
-                                let _ = sock.send_to(&packet, &target).await;
-                                println!("📤 Sent message update to {}", target);
+                                if let Ok(_) = sock.send_to(&packet, &target).await {
+                                    net_settings.lock().unwrap().packets_sent += 1;
+                                }
                             }
                         }
                     }
@@ -215,7 +239,7 @@ async fn main() -> Result<(), eframe::Error> {
 
                 res = async {
                     if let Some(sock) = &socket {
-                        let mut buf = [0u8; 4096]; // Larger buffer for history
+                        let mut buf = [0u8; 8192];
                         match sock.recv_from(&mut buf).await {
                             Ok((len, addr)) => Some((buf[..len].to_vec(), addr)),
                             Err(_) => None,
@@ -226,6 +250,11 @@ async fn main() -> Result<(), eframe::Error> {
                     }
                 } => {
                     if let (Some((packet, addr)), Some(k)) = (res, &key) {
+                        let mut s_lock = net_settings.lock().unwrap();
+                        s_lock.packets_received += 1;
+                        s_lock.last_peer_seen = addr.to_string();
+                        drop(s_lock);
+
                         if packet.len() > 12 {
                             let nonce = Nonce::from_slice(&packet[..12]);
                             let ciphertext = &packet[12..];
@@ -234,12 +263,8 @@ async fn main() -> Result<(), eframe::Error> {
                             if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
                                 if let Ok(new_state) = bincode::deserialize::<AppState>(&plaintext) {
                                     let mut s = net_state.lock().unwrap();
-                                    // Merge history or just overwrite for now (simple sync)
                                     *s = new_state;
-                                    println!("📥 Received update from {}", addr);
                                 }
-                            } else {
-                                println!("⚠️ Decryption failed from {}. Check Password/Room!", addr);
                             }
                         }
                     }
@@ -255,7 +280,7 @@ async fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "MicroSync Chat",
+        "MicroSync Diagnostics",
         options,
         Box::new(|cc| Box::new(MicroSyncApp::new(cc, state, settings, tx, connect_tx))),
     )
