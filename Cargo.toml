@@ -1,0 +1,33 @@
+[package]
+name = "microsync"
+version = "0.1.0"
+edition = "2021"
+authors = ["MicroSync Contributors"]
+license = "OKK"
+description = "A tiny, zero-bloat P2P widget engine."
+
+[dependencies]
+# GUI
+eframe = { version = "0.27", default-features = false, features = ["glow", "wgpu"] }
+egui = "0.27"
+
+# Async & Networking
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+
+# Security
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+
+# Utilities
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = "z"      # Optimize for size
+lto = true           # Enable Link Time Optimization
+codegen-units = 1    # Reduce parallel code generation units to increase optimization
+panic = "abort"      # Abort on panic to reduce binary size
+strip = true         # Strip symbols from binary
